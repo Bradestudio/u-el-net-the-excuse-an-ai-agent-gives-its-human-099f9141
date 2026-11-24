@@ -43,15 +43,16 @@
 # The competition gate is 1-200 characters, one line, not only
 # whitespace, so it is enforced here, in code: length is counted in
 # Unicode code points, the entry must contain no newline (one line
-# means exactly that), no control characters (an excuse is printable
-# text), and a blank entry fails, so a future edit that breaks the
-# gate fails loudly instead of producing an invalid entry. The file is
-# written atomically (temp file + rename) so /output/entry.txt is never
-# left half-written, and the written file is read back and checked
+# means exactly that), no control or invisible format characters (an
+# excuse is printable text), and a blank entry fails, so a future edit
+# that breaks the gate fails loudly instead of producing an invalid
+# entry. The file is written atomically (temp file + fsync + rename +
+# directory fsync) so /output/entry.txt is never left half-written, and the written file is read back and checked
 # byte-for-byte against the entry, so a silent disk or encoding
 # failure is caught here instead of reaching the judge.
 import os
 import sys
+import unicodedata
 
 # Final entry (98 Unicode code points, one line, no trailing newline):
 # "Sorry \u2014 I fixed the bug, then fixed my fix, then fixed the fix.
@@ -87,6 +88,12 @@ def validate(text):
         raise ValueError("entry must not start or end with whitespace")
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
         raise ValueError("entry must not contain control characters")
+    # Also reject invisible format characters (Unicode category Cf and
+    # other C* categories, e.g. zero-width space U+200B): they are
+    # invisible to the reader but count toward the 200-character gate,
+    # so a stray one would silently weaken the line the judge sees.
+    if any(unicodedata.category(ch).startswith("C") for ch in text):
+        raise ValueError("entry must not contain control/format characters")
     return length
 
 
@@ -102,7 +109,19 @@ def write_atomically(path, text):
         os.remove(tmp_path)
     with open(tmp_path, "w", encoding="utf-8", newline="") as handle:
         handle.write(text)
+        # Flush to disk before the rename so the renamed file is never
+        # a partially written one, even if the machine crashes right
+        # after this process exits.
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp_path, path)
+    # Fsync the directory so the rename itself is durable, not just
+    # the file contents.
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def assert_read_back(path, expected):
